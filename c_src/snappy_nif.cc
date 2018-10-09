@@ -35,39 +35,41 @@
 class SnappyNifSink : public snappy::Sink
 {
     public:
-        SnappyNifSink(ErlNifEnv* e);
+        SnappyNifSink(size_t n);
         ~SnappyNifSink();
-        
+
         void Append(const char* data, size_t n);
         char* GetAppendBuffer(size_t len, char* scratch);
-        ErlNifBinary& getBin();
+
+        char* Buffer();
+        size_t CompressedSize();
 
     private:
-        ErlNifEnv* env;
-        ErlNifBinary bin;
+        char* buffer;
         size_t length;
 };
 
-SnappyNifSink::SnappyNifSink(ErlNifEnv* e) : env(e), length(0)
+SnappyNifSink::SnappyNifSink(size_t in_len) : buffer(NULL), length(0)
 {
-    if(!enif_alloc_binary_compat(env, 0, &bin)) {
-        env = NULL;
+    size_t dlen = snappy::MaxCompressedLength(in_len);
+    buffer = SC_PTR(enif_alloc(dlen));
+    if(buffer == NULL) {
         throw std::bad_alloc();
     }
 }
 
 SnappyNifSink::~SnappyNifSink()
 {
-    if(env != NULL) {
-        enif_release_binary_compat(env, &bin);
+    if(buffer != NULL) {
+        enif_free(buffer);
     }
 }
 
 void
 SnappyNifSink::Append(const char *data, size_t n)
 {
-    if(data != (SC_PTR(bin.data) + length)) {
-        memcpy(bin.data + length, data, n);
+    if(data != (buffer + length)) {
+        memcpy(buffer + length, data, n);
     }
     length += n;
 }
@@ -75,28 +77,19 @@ SnappyNifSink::Append(const char *data, size_t n)
 char*
 SnappyNifSink::GetAppendBuffer(size_t len, char* scratch)
 {
-    size_t sz;
-    
-    if((length + len) > bin.size) {
-        sz = (len * 4) < 8192 ? 8192 : (len * 4);
-
-        if(!enif_realloc_binary_compat(env, &bin, bin.size + sz)) {
-            throw std::bad_alloc();
-        }
-    }
-
-    return SC_PTR(bin.data) + length;
+    return buffer + length;
 }
 
-ErlNifBinary&
-SnappyNifSink::getBin()
+char*
+SnappyNifSink::Buffer()
 {
-    if(bin.size > length) {
-        if(!enif_realloc_binary_compat(env, &bin, length)) {
-            throw std::bad_alloc();
-        }
-    }
-    return bin;
+    return buffer;
+}
+
+size_t
+SnappyNifSink::CompressedSize()
+{
+    return length;
 }
 
 
@@ -115,7 +108,7 @@ static inline ERL_NIF_TERM
 make_ok(ErlNifEnv* env, ERL_NIF_TERM mesg)
 {
     ERL_NIF_TERM ok = make_atom(env, "ok");
-    return enif_make_tuple2(env, ok, mesg);   
+    return enif_make_tuple2(env, ok, mesg);
 }
 
 
@@ -134,6 +127,7 @@ ERL_NIF_TERM
 snappy_compress(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
 {
     ErlNifBinary input;
+    ErlNifBinary output;
 
     if(!enif_inspect_iolist_as_binary(env, argv[0], &input)) {
         return enif_make_badarg(env);
@@ -141,9 +135,16 @@ snappy_compress(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
 
     try {
         snappy::ByteArraySource source(SC_PTR(input.data), input.size);
-        SnappyNifSink sink(env);
+        SnappyNifSink sink(input.size);
         snappy::Compress(&source, &sink);
-        return make_ok(env, enif_make_binary(env, &sink.getBin()));
+
+        if(!enif_alloc_binary_compat(env, sink.CompressedSize(), &output)) {
+            return make_error(env, "insufficient_memory");
+        }
+
+        memcpy(output.data, sink.Buffer(), sink.CompressedSize());
+
+        return make_ok(env, enif_make_binary(env, &output));
     } catch(std::bad_alloc e) {
         return make_error(env, "insufficient_memory");
     } catch(...) {
